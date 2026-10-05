@@ -1,0 +1,10 @@
+policies:
+  - name: s3-remediate-enable-default-encryption
+    resource: s3
+    comment: "Enforce AES256 server-side encryption on unencrypted S3 buckets"
+    filters:
+      - "ServerSideEncryptionConfiguration.Rules": absent
+    actions:
+      - type: set-bucket-encryption
+        crypto: AES256
+        enabled: true

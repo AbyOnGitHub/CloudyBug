@@ -1,0 +1,18 @@
+policies:
+  - name: s3-remediate-block-public-access
+    resource: s3
+    comment: "Automatically enforce Amazon S3 Block Public Access on vulnerable buckets"
+    filters:
+      - or:
+          - "PublicAccessBlockConfiguration.BlockPublicAcls": false
+          - "PublicAccessBlockConfiguration.BlockPublicPolicy": false
+          - "PublicAccessBlockConfiguration.IgnorePublicAcls": false
+          - "PublicAccessBlockConfiguration.RestrictPublicBuckets": false
+          - "PublicAccessBlockConfiguration": absent
+    actions:
+      - type: set-public-block
+        state: true
+        block_public_acls: true
+        block_public_policy: true
+        ignore_public_acls: true
+        restrict_public_buckets: true

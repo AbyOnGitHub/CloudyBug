@@ -1,0 +1,13 @@
+policies:
+  - name: ec2-remediate-revoke-unrestricted-ssh
+    resource: security-group
+    comment: "Revoke ingress rules exposing port 22 directly to 0.0.0.0/0"
+    filters:
+      - type: ingress
+        IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        Cidr: "0.0.0.0/0"
+    actions:
+      - type: remove-permissions
+        ingress: matched

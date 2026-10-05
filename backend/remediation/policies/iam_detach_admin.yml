@@ -1,0 +1,10 @@
+policies:
+  - name: iam-remediate-detach-administrator-access
+    resource: iam-role
+    comment: "Detach overly permissive AdministratorAccess policy from non-compliant IAM roles"
+    filters:
+      - type: attached-policy
+        pattern: ".*AdministratorAccess.*"
+    actions:
+      - type: detach-policy
+        policy: AdministratorAccess
