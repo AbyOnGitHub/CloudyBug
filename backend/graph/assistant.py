@@ -31,6 +31,8 @@ from backend.scanner.models import ScanRequest
 from backend.scanner.llm_parser import LLMASFFParser
 from backend.scanner.utils import get_localstack_client, check_localstack_connection
 from backend.agents.quarantined_llm import QuarantinedSanitizerAgent
+from backend.remediation.opa_service import OPAService
+from backend.remediation.cedar_service import CedarService
 
 logger = logging.getLogger("autonomous_security_assistant")
 logging.basicConfig(level=logging.INFO)
@@ -140,11 +142,20 @@ async def reasoning_node(state: SecurityAssistantState) -> Dict[str, Any]:
             f"[{f.get('severity', {}).get('level')}] {f.get('title')} on {f.get('resource', {}).get('name')}"
             for f in failed
         ]
-        summary = (
-            f"Autonomous reasoning identified {total_failed} active security violations "
-            f"across {len(set(f.get('resource', {}).get('service') for f in failed))} cloud services. "
-            f"Remediation is necessary to restore compliance."
-        )
+        
+        app_status = state.get("approval_status", {})
+        if app_status.get("status") == "REJECTED_BY_POLICY":
+            summary = (
+                f"Autonomous reasoning identified {total_failed} active security violations. "
+                f"Previous plan was REJECTED by OPA/Cedar policies: {app_status.get('feedback')}. "
+                f"Attempting to formulate an alternative compliant remediation strategy."
+            )
+        else:
+            summary = (
+                f"Autonomous reasoning identified {total_failed} active security violations "
+                f"across {len(set(f.get('resource', {}).get('service') for f in failed))} cloud services. "
+                f"Remediation is necessary to restore compliance."
+            )
     else:
         need_fix = False
         identified = []
@@ -304,29 +315,54 @@ async def human_approval_node(state: SecurityAssistantState) -> Dict[str, Any]:
         ),
     }
 
-    logger.info(f"[{session_id}] HumanApproval Node: Calling interrupt() to await authorization...")
+    # 2. Validate with OPA and Cedar before calling interrupt
+    opa = OPAService()
+    cedar = CedarService()
+    violations = []
+    
+    for action in remediation_plan:
+        metadata = {
+            "resource_id": action.get("resource_id", ""),
+            "environment": "production" if "prod" in action.get("resource_id", "").lower() else "development",
+            "policy_arn": "arn:aws:iam::aws:policy/AdministratorAccess" if action.get("action_type") == "DETACH_IAM_ADMIN_POLICY" else ""
+        }
+        if not opa.validate_action(action.get("action_type", ""), metadata):
+            violations.append(f"OPA Denied: {action.get('action_type')} on {action.get('resource_id')}")
+        if not cedar.is_authorized("agent", action.get("action_type", ""), action.get("resource_id", ""), metadata):
+            violations.append(f"Cedar Denied: {action.get('action_type')} on {action.get('resource_id')}")
 
-    # 2. INTERRUPT EXECUTION - Pauses graph and saves checkpoint state
-    human_response = interrupt(approval_payload)
+    if violations:
+        logger.warning(f"[{session_id}] Policy Validation Failed: {violations}. Routing back to Reasoning.")
+        is_approved = False
+        approver = "PolicyEngine"
+        feedback = "Plan rejected due to OPA/Cedar policy violations: " + ", ".join(violations)
+        status_label = "REJECTED_BY_POLICY"
+    else:
+        logger.info(f"[{session_id}] HumanApproval Node: Calling interrupt() to await authorization...")
 
-    # 3. Resumed with response from Command(resume={"approved": True/False, ...})
-    is_approved = False
-    approver = "Unknown Approver"
-    feedback = ""
+        # 3. INTERRUPT EXECUTION - Pauses graph and saves checkpoint state
+        human_response = interrupt(approval_payload)
 
-    if isinstance(human_response, dict):
-        is_approved = bool(human_response.get("approved", False))
-        approver = human_response.get("approver", "Security Engineer")
-        feedback = human_response.get("comments", human_response.get("feedback", ""))
-    elif isinstance(human_response, bool):
-        is_approved = human_response
-        approver = "Security Lead"
+        # 4. Resumed with response from Command(resume={"approved": True/False, ...})
+        is_approved = False
+        approver = "Unknown Approver"
+        feedback = ""
+
+        if isinstance(human_response, dict):
+            is_approved = bool(human_response.get("approved", False))
+            approver = human_response.get("approver", "Security Engineer")
+            feedback = human_response.get("comments", human_response.get("feedback", ""))
+        elif isinstance(human_response, bool):
+            is_approved = human_response
+            approver = "Security Lead"
+            
+        status_label = "APPROVED" if is_approved else "REJECTED"
 
     logger.info(f"[{session_id}] HumanApproval Node: Resumed! Decision approved={is_approved} by {approver}")
 
     now_iso = datetime.now(timezone.utc).isoformat()
     approval_status = {
-        "status": "APPROVED" if is_approved else "REJECTED",
+        "status": status_label,
         "is_approved": is_approved,
         "approver": approver,
         "feedback": feedback,
@@ -362,6 +398,9 @@ async def human_approval_node(state: SecurityAssistantState) -> Dict[str, Any]:
 
 def route_after_approval(state: SecurityAssistantState) -> str:
     """Conditional Edge: Approved? -> Yes: ExecuteRemediation, No: Finish."""
+    app_status = state.get("approval_status", {}).get("status")
+    if app_status == "REJECTED_BY_POLICY":
+        return "Reasoning"
     if state.get("is_approved", False):
         return "ExecuteRemediation"
     return "Finish"
@@ -736,11 +775,12 @@ def build_security_assistant(checkpointer=None):
 
     workflow.add_edge("RiskAssessment", "HumanApproval")
 
-    # HumanApproval -> (Approved? -> Yes: ExecuteRemediation, No: Finish)
+    # HumanApproval -> (Approved? -> Yes: ExecuteRemediation, No: Finish, RejectedByPolicy: Reasoning)
     workflow.add_conditional_edges(
         "HumanApproval",
         route_after_approval,
         {
+            "Reasoning": "Reasoning",
             "ExecuteRemediation": "ExecuteRemediation",
             "Finish": "Finish",
         },

@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from backend.api.deps import get_prowler_service, get_parser
 from backend.core.config import settings
 from backend.agents import dual_agent_coordinator, DualAgentAuditResponse, SanitizedCloudPayload
+from backend.scanner.trivy_service import TrivyService
 
 router = APIRouter(tags=["Security Scanner"])
 
@@ -64,6 +65,18 @@ async def run_scan(
 
     try:
         response = service.execute_scan(req)
+        
+        # Merge Trivy IaC Findings
+        try:
+            trivy = TrivyService()
+            trivy_findings = trivy.scan_iac("terraform")
+            if trivy_findings:
+                response.findings.extend(trivy_findings)
+                if response.summary:
+                    response.summary.total_findings += len(trivy_findings)
+        except Exception as trivy_err:
+            pass
+            
         failed_count = sum(1 for f in response.findings if f.compliance_status == ComplianceStatus.FAILED)
 
         # 2. Broadcast findings discovered event as NDJSON

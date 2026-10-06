@@ -146,3 +146,68 @@ resource "aws_security_group" "compliant_web_sg" {
     SecurityAudit = "Passed-HTTPS"
   }
 }
+
+# ==========================================
+# 4. Agent Execution Role & Permissions Boundary
+# ==========================================
+
+resource "aws_iam_policy" "agent_permissions_boundary" {
+  name        = "agent-permissions-boundary"
+  description = "Permissions boundary for the autonomous security agent to prevent privilege escalation (OWASP LLM06)"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowSpecificServices"
+        Effect = "Allow"
+        Action = [
+          "s3:*",
+          "ec2:*",
+          "securityhub:*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "DenyIAMModificationsToSelf"
+        Effect = "Deny"
+        Action = [
+          "iam:PutRolePolicy",
+          "iam:AttachRolePolicy",
+          "iam:DeleteRolePolicy",
+          "iam:DetachRolePolicy",
+          "iam:UpdateAssumeRolePolicy"
+        ]
+        Resource = "arn:aws:iam::*:role/agent-execution-role"
+      },
+      {
+        Sid    = "RestrictPassRole"
+        Effect = "Allow"
+        Action = "iam:PassRole"
+        Resource = [
+          "arn:aws:iam::*:role/compliant-readonly-role"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role" "agent_execution_role" {
+  name = "agent-execution-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  permissions_boundary = aws_iam_policy.agent_permissions_boundary.arn
+}
+
