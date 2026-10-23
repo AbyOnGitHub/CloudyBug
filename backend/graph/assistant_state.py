@@ -149,17 +149,20 @@ class SecurityAssistantState(TypedDict, total=False):
     endpoint_url: str
     target_services: List[str]
 
-    # Node 1: Observation
+    # Node 1: Observation & Attack Ingestion
     raw_findings: List[Dict[str, Any]]
     observed_findings: List[Dict[str, Any]]
     total_observed: int
     failed_observed: int
     passed_observed: int
+    detected_attacks: List[Dict[str, Any]]
+    threat_level: str  # "NOMINAL", "ELEVATED", "ACTIVE_ATTACK", "DEFENDED"
 
-    # Node 2: Reasoning
+    # Node 2: Reasoning & Exploit Correlation
     need_fix: bool
     reasoning_summary: str
     identified_issues: List[str]
+    correlated_exploits: List[Dict[str, Any]]  # Mapping between attacks and vulnerabilities
 
     # Node 3: RiskAssessment
     risk_score: float
@@ -179,10 +182,11 @@ class SecurityAssistantState(TypedDict, total=False):
     execution_errors: List[str]
     executed_at: str
 
-    # Node 6: VerifyFix
+    # Node 6: VerifyFix & Attack Prevention Probe
     verification_results: List[VerificationResult]
     verification_passed: bool
     verified_at: str
+    prevention_results: List[Dict[str, Any]]  # Proof of attack blocked post-fix
 
     # Node 7: Finish
     final_status: str  # "FIXED", "CLEAN", "REJECTED", "PARTIAL"
@@ -202,6 +206,12 @@ class SecurityStateModel(BaseModel):
     execution_history: List[Dict[str, Any]] = Field(default_factory=list, description="Audit trail of state transitions")
     reasoning_trace: List[Dict[str, Any]] = Field(default_factory=list, description="Cognitive reasoning steps per node")
     timestamps: Dict[str, str] = Field(default_factory=dict, description="ISO lifecycle timestamps per node")
+
+    # Threat & Attack Prevention Attributes
+    detected_attacks: List[Dict[str, Any]] = Field(default_factory=list, description="Active attacks ingested from telemetry")
+    correlated_exploits: List[Dict[str, Any]] = Field(default_factory=list, description="Attacks mapped to exploited vulnerabilities")
+    prevention_results: List[Dict[str, Any]] = Field(default_factory=list, description="Verified attack prevention probe results")
+    threat_level: Optional[str] = Field(default="NOMINAL", description="Current threat posture level")
 
     session_id: Optional[str] = Field(default=None, description="Current workflow session ID")
     thread_id: Optional[str] = Field(default=None, description="PostgreSQL checkpointer thread identifier")

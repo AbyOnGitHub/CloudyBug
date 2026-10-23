@@ -1,5 +1,6 @@
 export type NavigationTab = 
   | 'dashboard' 
+  | 'attacks'
   | 'activity' 
   | 'findings' 
   | 'approval' 

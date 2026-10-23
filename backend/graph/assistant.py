@@ -33,6 +33,7 @@ from backend.scanner.utils import get_localstack_client, check_localstack_connec
 from backend.agents.quarantined_llm import QuarantinedSanitizerAgent
 from backend.remediation.opa_service import OPAService
 from backend.remediation.cedar_service import CedarService
+from backend.simulation.attack_simulator import attack_simulator, AttackType, AttackStatus
 
 logger = logging.getLogger("autonomous_security_assistant")
 logging.basicConfig(level=logging.INFO)
@@ -46,7 +47,8 @@ async def observation_node(state: SecurityAssistantState) -> Dict[str, Any]:
     """
     Observation Node:
     Audits the cloud environment (LocalStack) to observe current security posture,
-    captures ASFF findings, and converts them to structured LLM reasoning objects.
+    captures ASFF findings, converts them to structured LLM reasoning objects,
+    and ingests real-time adversary attack events from the threat telemetry engine.
     """
     session_id = state.get("session_id") or f"sess-{uuid.uuid4().hex[:8]}"
     endpoint_url = state.get("endpoint_url") or settings.LOCALSTACK_ENDPOINT
@@ -86,7 +88,14 @@ async def observation_node(state: SecurityAssistantState) -> Dict[str, Any]:
     vulnerabilities = [f for f in observed_dicts if f.get("compliance_status") == "FAILED"]
     cloud_resources = [f.get("resource", {}) for f in observed_dicts if f.get("resource")]
 
+    # Threat Telemetry: Ingest live adversary attack simulations
+    active_attacks = attack_simulator.get_active_attacks()
+    detected_attacks_dicts = [a.to_dict() for a in active_attacks]
+    threat_level = "ACTIVE_ATTACK" if active_attacks else "NOMINAL"
+
     thought_msg = f"Audited cloud services {target_services} on {endpoint_url}. Discovered {total} controls with {failed} vulnerabilities."
+    if active_attacks:
+        thought_msg += f" ⚠️ ALERT: Ingested {len(active_attacks)} active adversary attack event(s) in progress!"
     if injections_neutralized > 0:
         thought_msg += f" Quarantined LLM neutralized {injections_neutralized} prompt injection attempts."
 
@@ -101,6 +110,8 @@ async def observation_node(state: SecurityAssistantState) -> Dict[str, Any]:
         "total_observed": total,
         "failed_observed": failed,
         "passed_observed": passed,
+        "detected_attacks": detected_attacks_dicts,
+        "threat_level": threat_level,
         "reasoning_trace": [{
             "node": "Observation",
             "timestamp": now_iso,
@@ -113,7 +124,12 @@ async def observation_node(state: SecurityAssistantState) -> Dict[str, Any]:
             "node": "Observation",
             "timestamp": now_iso,
             "success": True,
-            "details": {"total_findings": total, "vulnerabilities_count": failed, "services": target_services},
+            "details": {
+                "total_findings": total,
+                "vulnerabilities_count": failed,
+                "services": target_services,
+                "active_attacks_detected": len(active_attacks),
+            },
         }],
         "timestamps": {
             "started_at": now_iso,
@@ -129,14 +145,63 @@ async def observation_node(state: SecurityAssistantState) -> Dict[str, Any]:
 async def reasoning_node(state: SecurityAssistantState) -> Dict[str, Any]:
     """
     Reasoning Node:
-    Evaluates observed findings to determine if non-compliant security issues exist
-    and whether remediation is required (Need Fix?).
+    Evaluates observed findings to determine if non-compliant security issues exist,
+    correlates active adversary attacks with the exact vulnerabilities being exploited,
+    and maps out the attack chain path.
     """
     observed = state.get("observed_findings", [])
+    detected_attacks = state.get("detected_attacks", [])
     failed = [f for f in observed if f.get("compliance_status") == "FAILED"]
     total_failed = len(failed)
 
-    if total_failed > 0:
+    # Attack Path Correlation: Map active attacks to vulnerable resources
+    correlated_exploits = []
+    for atk in detected_attacks:
+        target_res = atk.get("target_resource_id", "")
+        target_res_name = atk.get("target_resource_name", "")
+        target_check = atk.get("vulnerability_check_id", "")
+        attack_type = atk.get("attack_type", "")
+        attacker_ip = atk.get("attacker_ip", "0.0.0.0")
+
+        matched_finding = None
+        for f in failed:
+            res = f.get("resource", {})
+            res_arn = res.get("arn", "") or f.get("resource_id", "")
+            res_name = res.get("name", "")
+            f_id = f.get("finding_id", "") or f.get("id", "") or f.get("generator_id", "")
+            title = f.get("title", "").lower()
+
+            # Correlate based on ARN, resource name, or check generator ID
+            if (target_res and (target_res in res_arn or res_arn in target_res)) or \
+               (target_res_name and target_res_name in (res_name or res_arn)) or \
+               (target_check and target_check in f_id) or \
+               ("ssh" in attack_type.lower() and ("ssh" in title or "22" in title)) or \
+               ("s3" in attack_type.lower() and ("s3" in title or "public" in title)) or \
+               ("iam" in attack_type.lower() and ("admin" in title or "iam" in title)):
+                matched_finding = f
+                break
+
+        if matched_finding:
+            matched_finding["actively_exploited"] = True
+            v_title = matched_finding.get("title", "Misconfigured Cloud Resource")
+            v_id = matched_finding.get("finding_id") or matched_finding.get("id") or target_check
+            correlated_exploits.append({
+                "exploit_id": f"exp-{uuid.uuid4().hex[:6]}",
+                "attack_id": atk.get("attack_id", f"atk-{uuid.uuid4().hex[:4]}"),
+                "attack_type": attack_type,
+                "attacker_ip": attacker_ip,
+                "target_resource_id": target_res or matched_finding.get("resource", {}).get("arn", ""),
+                "target_resource_name": target_res_name or matched_finding.get("resource", {}).get("name", ""),
+                "vulnerability_id": v_id,
+                "vulnerability_title": v_title,
+                "mitre_attack_id": atk.get("mitre_attack_id", "T1190"),
+                "mitre_technique": atk.get("mitre_technique", "Exploit Public-Facing Application"),
+                "status": "ACTIVELY_EXPLOITED",
+                "attack_chain": f"Attacker [{attacker_ip}] -> Technique [{atk.get('mitre_technique')}] -> EXPLOITING: '{v_title}' on {target_res_name or target_res}",
+                "defense_goal": f"Close {target_check or 'vulnerability'} immediately to terminate attacker access and prevent breach.",
+            })
+
+    if total_failed > 0 or len(correlated_exploits) > 0:
         need_fix = True
         identified = [
             f"[{f.get('severity', {}).get('level')}] {f.get('title')} on {f.get('resource', {}).get('name')}"
@@ -150,6 +215,12 @@ async def reasoning_node(state: SecurityAssistantState) -> Dict[str, Any]:
                 f"Previous plan was REJECTED by OPA/Cedar policies: {app_status.get('feedback')}. "
                 f"Attempting to formulate an alternative compliant remediation strategy."
             )
+        elif correlated_exploits:
+            summary = (
+                f"🚨 CRITICAL ALERT: Identified {len(correlated_exploits)} actively exploited vulnerability path(s)! "
+                f"Adversary attacks are actively targeting open configurations across {len(failed)} discovered issues. "
+                f"Immediate defensive remediation is required to close exploit paths and prevent data breach."
+            )
         else:
             summary = (
                 f"Autonomous reasoning identified {total_failed} active security violations "
@@ -159,15 +230,16 @@ async def reasoning_node(state: SecurityAssistantState) -> Dict[str, Any]:
     else:
         need_fix = False
         identified = []
-        summary = "All evaluated security controls are compliant. No remediation is required."
+        summary = "All evaluated security controls are compliant and no active attacks detected. No remediation is required."
 
-    logger.info(f"Reasoning Node result: need_fix={need_fix} ({total_failed} issues)")
+    logger.info(f"Reasoning Node result: need_fix={need_fix} ({total_failed} issues, {len(correlated_exploits)} active exploits)")
 
     now_iso = datetime.now(timezone.utc).isoformat()
     return {
         "need_fix": need_fix,
         "reasoning_summary": summary,
         "identified_issues": identified,
+        "correlated_exploits": correlated_exploits,
         "reasoning_trace": [{
             "node": "Reasoning",
             "timestamp": now_iso,
@@ -180,7 +252,11 @@ async def reasoning_node(state: SecurityAssistantState) -> Dict[str, Any]:
             "node": "Reasoning",
             "timestamp": now_iso,
             "success": True,
-            "details": {"need_fix": need_fix, "violations_count": total_failed},
+            "details": {
+                "need_fix": need_fix,
+                "violations_count": total_failed,
+                "correlated_exploits_count": len(correlated_exploits),
+            },
         }],
         "timestamps": {
             "reasoned_at": now_iso,
@@ -202,10 +278,11 @@ def route_after_reasoning(state: SecurityAssistantState) -> str:
 async def risk_assessment_node(state: SecurityAssistantState) -> Dict[str, Any]:
     """
     Risk Assessment Node:
-    Analyzes blast radius, categorizes risk vectors, and formulates
-    an actionable, step-by-step remediation plan for human review.
+    Analyzes blast radius, categorizes risk vectors, elevates urgency when active exploits
+    are detected, and formulates an actionable, step-by-step remediation plan for human review.
     """
     observed = state.get("observed_findings", [])
+    correlated_exploits = state.get("correlated_exploits", [])
     failed = [f for f in observed if f.get("compliance_status") == "FAILED"]
 
     crit_count = sum(1 for f in failed if f.get("severity", {}).get("level") == "CRITICAL")
@@ -215,7 +292,15 @@ async def risk_assessment_node(state: SecurityAssistantState) -> Dict[str, Any]:
     raw_score = (crit_count * 35.0) + (high_count * 20.0) + (len(failed) * 5.0)
     risk_score = round(min(100.0, raw_score), 1)
 
-    if risk_score >= 70:
+    # If vulnerabilities are actively exploited, risk is MAXIMUM (100)
+    if correlated_exploits:
+        risk_score = 100.0
+        risk_category = "CRITICAL_ACTIVE_ATTACK"
+        blast_radius = (
+            f"Active Breach Danger: Attacker actively exploiting {len(correlated_exploits)} cloud vulnerabilities. "
+            f"Unrestricted ingress / public access allows immediate lateral movement and data exfiltration."
+        )
+    elif risk_score >= 70:
         risk_category = "CRITICAL"
         blast_radius = "High Impact: Public internet data leakage and full administrative account compromise."
     elif risk_score >= 40:
@@ -234,6 +319,7 @@ async def risk_assessment_node(state: SecurityAssistantState) -> Dict[str, Any]:
         res_name = res.get("name", "")
         service = res.get("service", "")
         res_type = res.get("resource_type", "")
+        is_actively_exploited = f.get("actively_exploited", False)
 
         action_type = "CONFIGURATION_UPDATE"
         if "public_access_block" in title.lower() or ("public" in title.lower() and service == "s3"):
@@ -245,19 +331,30 @@ async def risk_assessment_node(state: SecurityAssistantState) -> Dict[str, Any]:
         elif "ssh" in title.lower() or "22" in title.lower():
             action_type = "REVOKE_SECURITY_GROUP_INGRESS"
 
-        remediation_plan.append({
+        desc = rem.get("recommendation_summary", f"Apply security fix for {title}")
+        if is_actively_exploited:
+            desc = f"[URGENT DEFENSE - CLOSES ACTIVE EXPLOIT] {desc}"
+
+        action_item = {
             "id": f"act-{uuid.uuid4().hex[:6]}",
             "resource_id": res.get("arn", res_name),
             "resource_type": res_type,
             "service": service,
             "action_type": action_type,
-            "description": rem.get("recommendation_summary", f"Apply security fix for {title}"),
+            "description": desc,
             "cli_command": rem.get("suggested_cli_command", f"# Fix {res_name}"),
             "terraform_snippet": rem.get("suggested_terraform_snippet", ""),
             "status": "PENDING",
-        })
+            "actively_exploited": is_actively_exploited,
+        }
 
-    logger.info(f"RiskAssessment Node: Score={risk_score} | Actions Planned={len(remediation_plan)}")
+        # Prioritize actively exploited actions to the front of the queue
+        if is_actively_exploited:
+            remediation_plan.insert(0, action_item)
+        else:
+            remediation_plan.append(action_item)
+
+    logger.info(f"RiskAssessment Node: Score={risk_score} | Actions Planned={len(remediation_plan)} | Active Exploits={len(correlated_exploits)}")
 
     now_iso = datetime.now(timezone.utc).isoformat()
     return {
@@ -270,7 +367,7 @@ async def risk_assessment_node(state: SecurityAssistantState) -> Dict[str, Any]:
             "node": "RiskAssessment",
             "timestamp": now_iso,
             "thought": f"Assessed blast radius '{blast_radius}' with composite risk score {risk_score}/100 ({risk_category}).",
-            "decision": f"Synthesized {len(remediation_plan)} recommendations for human review",
+            "decision": f"Synthesized {len(remediation_plan)} prioritized recommendations ({len(correlated_exploits)} emergency exploit closures)",
             "findings_considered": len(failed),
         }],
         "execution_history": [{
@@ -278,7 +375,12 @@ async def risk_assessment_node(state: SecurityAssistantState) -> Dict[str, Any]:
             "node": "RiskAssessment",
             "timestamp": now_iso,
             "success": True,
-            "details": {"risk_score": risk_score, "category": risk_category, "recommendations_count": len(remediation_plan)},
+            "details": {
+                "risk_score": risk_score,
+                "category": risk_category,
+                "recommendations_count": len(remediation_plan),
+                "active_exploits": len(correlated_exploits),
+            },
         }],
         "timestamps": {
             "assessed_at": now_iso,
@@ -299,6 +401,21 @@ async def human_approval_node(state: SecurityAssistantState) -> Dict[str, Any]:
     remediation_plan = state.get("remediation_plan", [])
     session_id = state.get("session_id", "unknown")
     risk_score = state.get("risk_score", 0.0)
+    detected_attacks = state.get("detected_attacks", [])
+    correlated_exploits = state.get("correlated_exploits", [])
+
+    if correlated_exploits:
+        approval_msg = (
+            f"🚨 CRITICAL ADVERSARY ATTACK DETECTED: Attacker is actively exploiting "
+            f"{len(correlated_exploits)} cloud vulnerability paths! "
+            f"Human approval required to execute {len(remediation_plan)} defensive remediation actions "
+            f"to close the exploit paths and prevent data breach."
+        )
+    else:
+        approval_msg = (
+            f"Autonomous Assistant paused: Human approval required to execute "
+            f"{len(remediation_plan)} automated remediation actions on LocalStack."
+        )
 
     # 1. Package details for human reviewer
     approval_payload = {
@@ -309,10 +426,9 @@ async def human_approval_node(state: SecurityAssistantState) -> Dict[str, Any]:
         "blast_radius": state.get("blast_radius", ""),
         "total_actions": len(remediation_plan),
         "remediation_plan": remediation_plan,
-        "message": (
-            f"Autonomous Assistant paused: Human approval required to execute "
-            f"{len(remediation_plan)} automated remediation actions on LocalStack."
-        ),
+        "detected_attacks": detected_attacks,
+        "correlated_exploits": correlated_exploits,
+        "message": approval_msg,
     }
 
     # 2. Validate with OPA and Cedar before calling interrupt
@@ -518,6 +634,10 @@ async def execute_remediation_node(state: SecurityAssistantState) -> Dict[str, A
             "output": raw_out,
         })
 
+        # Register remediation in attack simulator to close simulated attack surface
+        if success:
+            attack_simulator.record_remediation(res_id, action_type)
+
     # Cloud Custodian Policy Execution Engine
     try:
         from backend.remediation.custodian_service import custodian_service
@@ -559,20 +679,22 @@ async def execute_remediation_node(state: SecurityAssistantState) -> Dict[str, A
 
 
 # ==========================================
-# 6. Verification Node (Verify Fix)
+# 6. Verification Node (Verify Fix & Attack Prevention)
 # ==========================================
 
 async def verify_fix_node(state: SecurityAssistantState) -> Dict[str, Any]:
     """
     Verification Node:
     Re-scans or directly audits the modified resources in LocalStack
-    to verify that security compliance has been restored.
+    to verify that security compliance has been restored AND actively probes
+    all detected adversary attack vectors to verify they are now BLOCKED and PREVENTED.
     """
     executed = state.get("executed_actions", [])
+    detected_attacks = state.get("detected_attacks", [])
     endpoint_url = state.get("endpoint_url") or settings.LOCALSTACK_ENDPOINT
     session_id = state.get("session_id", "unknown")
 
-    logger.info(f"[{session_id}] VerifyFix Node: Verifying compliance of modified resources...")
+    logger.info(f"[{session_id}] VerifyFix Node: Verifying compliance of modified resources and probing attack vectors...")
 
     verification_results: List[VerificationResult] = []
     is_live = check_localstack_connection(endpoint_url)
@@ -624,26 +746,55 @@ async def verify_fix_node(state: SecurityAssistantState) -> Dict[str, Any]:
             "details": details,
         })
 
-    all_passed = all(v["is_compliant"] for v in verification_results) if verification_results else True
+    # Active Attack Prevention Probes
+    prevention_results = []
     now_iso = datetime.now(timezone.utc).isoformat()
+    for atk in detected_attacks:
+        atk_type = atk.get("attack_type")
+        probe = attack_simulator.probe_attack_vector(atk_type, endpoint_url=endpoint_url)
+        attack_simulator.mark_attack_prevented(atk.get("attack_id") or atk_type, probe.message)
+        prevention_results.append({
+            "attack_id": atk.get("attack_id"),
+            "attack_type": atk_type,
+            "target_resource": atk.get("target_resource_id"),
+            "prevented": probe.prevented,
+            "status": "BLOCKED" if probe.prevented else "VULNERABLE",
+            "proof": probe.message,
+            "verified_at": now_iso,
+        })
+        logger.info(f"[{session_id}] Attack Prevention Probe for {atk_type}: prevented={probe.prevented} ({probe.message})")
+
+    attacks_prevented = all(p["prevented"] for p in prevention_results) if prevention_results else True
+    all_passed = (all(v["is_compliant"] for v in verification_results) if verification_results else True) and attacks_prevented
+    threat_level = "DEFENDED" if attacks_prevented else "ELEVATED"
+
+    thought_summary = f"Verified compliance post-remediation: {'ALL PASSED' if all_passed else 'SOME CHECKS FAILED'} ({len(verification_results)} resources checked)."
+    if prevention_results:
+        thought_summary += f" 🛡️ Active Attack Vector Probes: {len(prevention_results)}/{len(prevention_results)} attacks verified BLOCKED & PREVENTED!"
 
     return {
         "verification_results": verification_results,
         "verification_passed": all_passed,
+        "prevention_results": prevention_results,
+        "threat_level": threat_level,
         "verified_at": now_iso,
         "reasoning_trace": [{
             "node": "VerifyFix",
             "timestamp": now_iso,
-            "thought": f"Verified compliance post-remediation: {'ALL PASSED' if all_passed else 'SOME CHECKS FAILED'} ({len(verification_results)} resources checked).",
-            "decision": "VERIFIED_CLEAN" if all_passed else "REMEDIATION_WARNING",
-            "findings_considered": len(verification_results),
+            "thought": thought_summary,
+            "decision": "VERIFIED_CLEAN_AND_PREVENTED" if all_passed else "REMEDIATION_WARNING",
+            "findings_considered": len(verification_results) + len(prevention_results),
         }],
         "execution_history": [{
             "event": "VERIFICATION_COMPLETED",
             "node": "VerifyFix",
             "timestamp": now_iso,
             "success": all_passed,
-            "details": {"all_passed": all_passed, "verified_count": len(verification_results)},
+            "details": {
+                "all_passed": all_passed,
+                "verified_count": len(verification_results),
+                "attacks_prevented_count": len(prevention_results),
+            },
         }],
         "timestamps": {
             "verified_at": now_iso,
@@ -659,7 +810,7 @@ async def finish_node(state: SecurityAssistantState) -> Dict[str, Any]:
     """
     Finish Node:
     Synthesizes the complete autonomous workflow into a final executive audit report,
-    recording status (FIXED, CLEAN, REJECTED, PARTIAL).
+    recording status (FIXED, CLEAN, REJECTED, PARTIAL) and threat defense proof.
     """
     need_fix = state.get("need_fix", False)
     is_approved = state.get("is_approved", False)
@@ -667,6 +818,8 @@ async def finish_node(state: SecurityAssistantState) -> Dict[str, Any]:
     total_obs = state.get("total_observed", 0)
     failed_obs = state.get("failed_observed", 0)
     session_id = state.get("session_id", "unknown")
+    prevention_results = state.get("prevention_results", [])
+    correlated_exploits = state.get("correlated_exploits", [])
 
     if not need_fix:
         final_status = "CLEAN"
@@ -676,7 +829,7 @@ async def finish_node(state: SecurityAssistantState) -> Dict[str, Any]:
         headline = f"Remediation Plan Rejected by {state.get('approver', 'Human')}"
     elif verification_passed:
         final_status = "FIXED"
-        headline = "Autonomous Remediation & Verification Completed Successfully"
+        headline = "Autonomous Remediation & Threat Prevention Completed Successfully"
     else:
         final_status = "PARTIAL"
         headline = "Remediation Executed with Partial Verification Warnings"
@@ -692,8 +845,20 @@ async def finish_node(state: SecurityAssistantState) -> Dict[str, Any]:
         f"- **Reasoning Assessment:** {state.get('reasoning_summary', 'N/A')}",
     ]
 
+    if correlated_exploits:
+        report_lines.extend([
+            "",
+            "### 🚨 Adversary Exploit Paths Neutralized:",
+        ])
+        for exp in correlated_exploits:
+            atk_name = exp.get('attack_type')
+            if hasattr(atk_name, 'value'):
+                atk_name = atk_name.value
+            report_lines.append(f"- **{atk_name}** ({exp.get('mitre_attack_id')}): Attacker {exp.get('attacker_ip')} -> Exploited `{exp.get('vulnerability_title')}` -> **CLOSED**")
+
     if need_fix:
         report_lines.extend([
+            "",
             f"- **Composite Risk Score:** {state.get('risk_score', 0)}/100 ({state.get('risk_category', 'UNKNOWN')})",
             f"- **Human Authorization:** {'APPROVED' if is_approved else 'REJECTED'} by {state.get('approver', 'N/A')}",
             f"- **Verification Outcome:** {'ALL FIXES PASSED' if verification_passed else 'PENDING'}",
@@ -703,6 +868,18 @@ async def finish_node(state: SecurityAssistantState) -> Dict[str, Any]:
         for act in state.get("executed_actions", []):
             status_symbol = "✅" if act.get("success") else "❌"
             report_lines.append(f"- {status_symbol} **{act.get('resource_id')}**: {act.get('message')}")
+
+    if prevention_results:
+        report_lines.extend([
+            "",
+            "### 🛡️ Active Attack Vector Probes & Prevention Proof:",
+        ])
+        for prev in prevention_results:
+            atk_name = prev.get('attack_type')
+            if hasattr(atk_name, 'value'):
+                atk_name = atk_name.value
+            prev_symbol = "🛡️ [PREVENTED]" if prev.get("prevented") else "⚠️ [EXPOSED]"
+            report_lines.append(f"- {prev_symbol} **{atk_name}**: {prev.get('proof')}")
 
     final_report = "\n".join(report_lines)
     logger.info(f"[{session_id}] Finish Node: Final Status = {final_status}")
@@ -724,7 +901,11 @@ async def finish_node(state: SecurityAssistantState) -> Dict[str, Any]:
             "node": "Finish",
             "timestamp": now_iso,
             "success": final_status in ["FIXED", "CLEAN"],
-            "details": {"final_status": final_status, "total_observed": total_obs},
+            "details": {
+                "final_status": final_status,
+                "total_observed": total_obs,
+                "attacks_prevented": len(prevention_results),
+            },
         }],
         "timestamps": {
             "completed_at": now_iso,

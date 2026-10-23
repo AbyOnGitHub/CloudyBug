@@ -27,6 +27,13 @@ from backend.api.deps import get_prowler_service, get_parser
 from backend.core.config import settings
 from backend.agents import dual_agent_coordinator, DualAgentAuditResponse, SanitizedCloudPayload
 from backend.scanner.trivy_service import TrivyService
+from backend.simulation.attack_simulator import (
+    attack_simulator,
+    AttackType,
+    AttackStatus,
+    SimulatedAttackEvent,
+    AttackProbeResult,
+)
 
 router = APIRouter(tags=["Security Scanner"])
 
@@ -1020,4 +1027,162 @@ async def websocket_security_stream(websocket: WebSocket):
         ws_manager.disconnect(websocket)
     except Exception as e:
         ws_manager.disconnect(websocket)
+
+
+# ==========================================
+# Attack Simulation & Prevention Endpoints
+# ==========================================
+
+class SimulateAttackRequest(BaseModel):
+    attack_type: AttackType = Field(default=AttackType.SSH_BRUTE_FORCE, description="Adversary attack vector to simulate")
+    attacker_ip: Optional[str] = Field(default=None, description="Attacker IP address")
+    endpoint_url: Optional[str] = Field(default=None, description="LocalStack endpoint override")
+
+
+class ProbeAttackRequest(BaseModel):
+    attack_type: AttackType = Field(default=AttackType.SSH_BRUTE_FORCE, description="Adversary attack vector to probe")
+    endpoint_url: Optional[str] = Field(default=None, description="LocalStack endpoint override")
+
+
+@router.post(
+    "/attack/simulate",
+    summary="Simulate Real-World Adversary Attack Vector",
+    description="Simulates an active attack (SSH Brute Force, S3 Data Exfiltration, IAM Privilege Escalation) against LocalStack / AWS simulation environment.",
+)
+async def simulate_attack_endpoint(req: Optional[SimulateAttackRequest] = None) -> Dict[str, Any]:
+    request = req or SimulateAttackRequest()
+    event = attack_simulator.simulate_attack(
+        attack_type=request.attack_type,
+        attacker_ip=request.attacker_ip,
+        endpoint_url=request.endpoint_url,
+    )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # Broadcast real-time attack detection telemetry
+    await manager.broadcast_ndjson({
+        "event": "ATTACK_DETECTED",
+        "attack_id": event.attack_id,
+        "attack_type": event.attack_type.value,
+        "attacker_ip": event.attacker_ip,
+        "target_resource": event.target_resource_name,
+        "target_resource_id": event.target_resource_id,
+        "status": event.status.value,
+        "mitre_id": event.mitre_attack_id,
+        "mitre_technique": event.mitre_technique,
+        "message": event.title,
+        "payload_sample": event.payload_sample,
+        "timestamp": now_iso,
+    })
+
+    return {
+        "status": "success",
+        "attack_event": event.to_dict(),
+        "message": f"Adversary attack '{event.attack_type.value}' simulated successfully. Crawler observation node will ingest this threat.",
+    }
+
+
+@router.get(
+    "/attack/active",
+    summary="List Currently Active Attacks",
+    description="Returns all active adversary attack events simulated in the environment.",
+)
+async def get_active_attacks_endpoint() -> Dict[str, Any]:
+    attacks = attack_simulator.get_active_attacks()
+    return {
+        "status": "success",
+        "total_active": len(attacks),
+        "attacks": [a.to_dict() for a in attacks],
+    }
+
+
+@router.post(
+    "/attack/probe",
+    summary="Probe Cloud Attack Surface",
+    description="Directly tests whether a specific attack vector can breach the cloud environment or is blocked post-remediation.",
+)
+async def probe_attack_endpoint(req: Optional[ProbeAttackRequest] = None) -> Dict[str, Any]:
+    request = req or ProbeAttackRequest()
+    probe_result = attack_simulator.probe_attack_vector(
+        attack_type=request.attack_type,
+        endpoint_url=request.endpoint_url,
+    )
+    return {
+        "status": "success",
+        "probe": probe_result.model_dump(),
+    }
+
+
+@router.post(
+    "/attack/clear",
+    summary="Clear Simulated Attacks and Reset Environment",
+    description="Resets the simulated threat telemetry buffer.",
+)
+async def clear_attacks_endpoint() -> Dict[str, Any]:
+    attack_simulator.clear_attacks()
+    await manager.broadcast_ndjson({
+        "event": "ATTACK_TELEMETRY_CLEARED",
+        "message": "All simulated attack events cleared.",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"status": "success", "message": "All simulated attacks cleared."}
+
+
+@router.post(
+    "/assistant/attack-triage",
+    summary="End-to-End Attack Detection, Identification, Remediation & Prevention",
+    description="Executes a complete closed-loop workflow: simulates attack -> detects via crawler -> identifies exploited vulnerability -> auto-remediates -> verifies attack is PREVENTED.",
+)
+async def run_attack_triage_e2e(
+    req: Optional[SimulateAttackRequest] = None,
+) -> Dict[str, Any]:
+    request = req or SimulateAttackRequest()
+    
+    # 1. Simulate the attack
+    atk_event = attack_simulator.simulate_attack(
+        attack_type=request.attack_type,
+        attacker_ip=request.attacker_ip,
+        endpoint_url=request.endpoint_url,
+    )
+    
+    # 2. Launch assistant session
+    thread_id = f"thread-atk-{uuid.uuid4().hex[:6]}"
+    session_id = f"sess-atk-{uuid.uuid4().hex[:6]}"
+    config = {"configurable": {"thread_id": thread_id}}
+    initial_state = {
+        "session_id": session_id,
+        "thread_id": thread_id,
+        "target_services": ["s3", "iam", "ec2"],
+        "endpoint_url": request.endpoint_url or settings.LOCALSTACK_ENDPOINT,
+    }
+    
+    # Step through graph until interrupt
+    result_stage1 = await default_assistant_graph.ainvoke(initial_state, config)
+    
+    interrupts = result_stage1.get("__interrupt__", [])
+    if interrupts:
+        # 3. Auto-approve for automated end-to-end demo
+        resume_payload = {
+            "approved": True,
+            "approver": "Autonomous SOC Commander",
+            "comments": f"Emergency authorization: Terminate {request.attack_type.value} exploit path immediately.",
+        }
+        result_final = await default_assistant_graph.ainvoke(Command(resume=resume_payload), config)
+    else:
+        result_final = result_stage1
+
+    # 4. Verify post-remediation probe
+    final_probe = attack_simulator.probe_attack_vector(request.attack_type, endpoint_url=request.endpoint_url)
+
+    return {
+        "status": "COMPLETED",
+        "attack_simulated": atk_event.to_dict(),
+        "correlated_exploits": result_final.get("correlated_exploits", []),
+        "executed_remediations": result_final.get("executed_actions", []),
+        "prevention_results": result_final.get("prevention_results", []),
+        "final_probe": final_probe.model_dump(),
+        "attack_prevented": final_probe.prevented,
+        "final_report": result_final.get("final_report", ""),
+        "thread_id": thread_id,
+    }
+
 

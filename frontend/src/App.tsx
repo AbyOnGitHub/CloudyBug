@@ -6,6 +6,7 @@ import { ActivityStream } from './components/ActivityStream';
 import { VulnerabilityTable } from './components/VulnerabilityTable';
 import { ResourceMap } from './components/ResourceMap';
 import { ReasoningLogs } from './components/ReasoningLogs';
+import { AttackSimulationPanel } from './components/AttackSimulationPanel';
 import { useSecurityWebSocket } from './hooks/useSecurityWebSocket';
 import { NavigationTab } from './types/security';
 import { 
@@ -122,6 +123,32 @@ export const App: React.FC = () => {
                 </div>
               </div>
 
+              {/* Adversary Attack Simulator Quick Access Banner */}
+              <div className="p-4 rounded-2xl bg-gradient-to-r from-rose-950/30 via-slate-900 to-cyan-950/20 border border-rose-500/30 backdrop-blur-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <div className="p-2.5 rounded-xl bg-rose-500/20 border border-rose-500/40 text-rose-400">
+                    <Flame className="w-5 h-5 animate-pulse" />
+                  </div>
+                  <div>
+                    <h4 className="text-sm font-bold text-slate-100 flex items-center gap-2">
+                      Adversary Attack Simulation & Defense Active
+                      <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-rose-500/20 text-rose-300 border border-rose-500/40">
+                        ATTACK TESTBED
+                      </span>
+                    </h4>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Simulate SSH brute-force, S3 exfiltration, and IAM escalation attacks to verify that the security crawler detects and prevents active exploits.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setCurrentTab('attacks')}
+                  className="px-4 py-2 rounded-xl bg-rose-600/90 hover:bg-rose-500 text-white text-xs font-mono font-bold shrink-0 transition-all shadow-md shadow-rose-600/20"
+                >
+                  Launch Attack Simulator →
+                </button>
+              </div>
+
               {/* 3. Human Approval Panel (Highlighted First Class Citizen) */}
               <HumanApprovalPanel
                 items={approvalItems}
@@ -176,6 +203,9 @@ export const App: React.FC = () => {
               </div>
             </div>
           )}
+
+          {/* TAB: ATTACK SIMULATION & DEFENSE */}
+          {currentTab === 'attacks' && <AttackSimulationPanel />}
 
           {/* TAB 2: ACTIVITY STREAM */}
           {currentTab === 'activity' && (

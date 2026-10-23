@@ -1,6 +1,7 @@
 import React from 'react';
 import { 
   LayoutDashboard, 
+  Flame,
   Activity, 
   ShieldAlert, 
   UserCheck, 
@@ -26,6 +27,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   const navItems = [
     { id: 'dashboard' as NavigationTab, label: 'Dashboard', icon: LayoutDashboard },
+    { id: 'attacks' as NavigationTab, label: 'Attack Simulator', icon: Flame },
     { id: 'activity' as NavigationTab, label: 'Activity Stream', icon: Activity },
     { id: 'findings' as NavigationTab, label: 'Current Findings', icon: ShieldAlert },
     { 
