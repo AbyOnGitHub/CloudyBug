@@ -206,6 +206,56 @@ const INITIAL_REASONING_TRACES: ReasoningNodeTrace[] = [
   },
 ];
 
+/**
+ * Maps a backend NormalizedFinding (flat severity, no `service`, `compliance_frameworks`)
+ * into the frontend `Finding` shape expected by the dashboard components.
+ */
+function deriveService(raw: any): string {
+  if (typeof raw?.service === 'string' && raw.service) return raw.service.toUpperCase();
+  const hint = `${raw?.resource_type || ''} ${raw?.generator_id || ''} ${raw?.resource_id || ''}`.toLowerCase();
+  if (hint.includes('s3')) return 'S3';
+  if (hint.includes('iam')) return 'IAM';
+  if (hint.includes('ec2') || hint.includes('sg-') || hint.includes('securitygroup') || hint.includes('instance')) return 'EC2';
+  if (hint.includes('rds') || hint.includes('database') || hint.includes('db')) return 'RDS';
+  if (hint.includes('cloudtrail') || hint.includes('trail')) return 'CLOUDTRAIL';
+  return 'OTHER';
+}
+
+function normalizeFinding(raw: any, index: number): Finding {
+  const resourceId: string = String(raw?.resource_id ?? raw?.resourceId ?? `resource-${index}`);
+  const severity: Finding['severity'] =
+    raw?.severity && typeof raw.severity === 'object'
+      ? raw.severity
+      : {
+          level: (String(raw?.severity || 'MEDIUM').toUpperCase() as any),
+          score: Number(raw?.severity_score ?? 0),
+        };
+  const resourceName: string =
+    raw?.resource_name || resourceId.split(/[:/]/).filter(Boolean).pop() || resourceId;
+
+  return {
+    finding_id: String(raw?.finding_id ?? raw?.id ?? `finding-${index}`),
+    title: String(raw?.title ?? 'Untitled finding'),
+    description: String(raw?.description ?? ''),
+    severity,
+    resource_id: resourceId,
+    resource_name: resourceName,
+    resource_type: String(raw?.resource_type ?? 'Unknown'),
+    service: deriveService(raw),
+    compliance_status: (raw?.compliance_status ?? 'FAILED') as any,
+    recommendation:
+      raw?.recommendation && typeof raw.recommendation === 'object'
+        ? raw.recommendation
+        : { text: String(raw?.recommendation ?? ''), url: raw?.recommendation_url ?? undefined },
+    frameworks: Array.isArray(raw?.frameworks)
+      ? raw.frameworks
+      : Array.isArray(raw?.compliance_frameworks)
+        ? raw.compliance_frameworks
+        : [],
+    first_observed_at: raw?.first_observed_at ?? raw?.created_at,
+  };
+}
+
 export function useSecurityWebSocket() {
   const [isConnected, setIsConnected] = useState<boolean>(true);
   const [currentStep, setCurrentStep] = useState<string>('Waiting for Approval...');
@@ -253,8 +303,8 @@ export function useSecurityWebSocket() {
     } else if (eventType === 'FINDINGS_DISCOVERED') {
       setCurrentStep(event.step || `Found ${event.count || 5} issues`);
       if (event.progress !== undefined) setProgressPercent(event.progress);
-      if (event.findings && event.findings.length > 0) {
-        setFindings(event.findings);
+      if (Array.isArray(event.findings) && event.findings.length > 0) {
+        setFindings(event.findings.map((f, i) => normalizeFinding(f, i)));
       }
       appendActivityLog({
         step: event.step || 'Found 5 issues',

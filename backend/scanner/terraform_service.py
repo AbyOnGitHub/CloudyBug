@@ -234,6 +234,85 @@ class TerraformService:
                 details={"open_ssh": False, "port": 443},
             ))
 
+            # --- EC2 Instance (IMDSv1 Vulnerable) ---
+            inst_id = "i-0123456789abcdef0"
+            if is_live:
+                try:
+                    ec2 = get_localstack_client("ec2", endpoint_url=target_endpoint)
+                    # Attempt to run mock instance if supported
+                    try:
+                        ec2.run_instances(
+                            ImageId="ami-00000000",
+                            InstanceType="t3.micro",
+                            MinCount=1,
+                            MaxCount=1,
+                            MetadataOptions={"HttpTokens": "optional", "HttpEndpoint": "enabled"},
+                        )
+                        logs.append(f"Created EC2 instance with IMDSv1: {inst_id}")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logs.append(f"EC2 instance provisioning error: {e}")
+
+            deployed.append(TerraformResourceStatus(
+                resource_type="aws_instance",
+                resource_id=f"arn:aws:ec2:us-east-1:000000000000:instance/{inst_id}",
+                name="vulnerable-web-app",
+                is_vulnerable=True,
+                details={"imds_tokens": "optional", "instance_id": inst_id},
+            ))
+
+            # --- RDS Database (Publicly Accessible) ---
+            db_id = "vulnerable-customer-db"
+            if is_live:
+                try:
+                    rds = get_localstack_client("rds", endpoint_url=target_endpoint)
+                    try:
+                        rds.create_db_instance(
+                            DBInstanceIdentifier=db_id,
+                            AllocatedStorage=5,
+                            DBInstanceClass="db.t3.micro",
+                            Engine="postgres",
+                            PubliclyAccessible=True,
+                        )
+                        logs.append(f"Created RDS Database: {db_id} (PubliclyAccessible=True)")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logs.append(f"RDS provisioning error: {e}")
+
+            deployed.append(TerraformResourceStatus(
+                resource_type="aws_db_instance",
+                resource_id=f"arn:aws:rds:us-east-1:000000000000:db:{db_id}",
+                name=db_id,
+                is_vulnerable=True,
+                details={"publicly_accessible": True},
+            ))
+
+            # --- CloudTrail Audit Trail (Logging Disabled) ---
+            trail_name = "cloudybug-trail"
+            if is_live:
+                try:
+                    ct = get_localstack_client("cloudtrail", endpoint_url=target_endpoint)
+                    try:
+                        ct.create_trail(
+                            Name=trail_name,
+                            S3BucketName=compliant_bucket,
+                        )
+                        logs.append(f"Created CloudTrail audit trail: {trail_name} (Logging disabled)")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logs.append(f"CloudTrail provisioning error: {e}")
+
+            deployed.append(TerraformResourceStatus(
+                resource_type="aws_cloudtrail",
+                resource_id=f"arn:aws:cloudtrail:us-east-1:000000000000:trail/{trail_name}",
+                name=trail_name,
+                is_vulnerable=True,
+                details={"logging_enabled": False},
+            ))
+
         return TerraformDeploymentResult(
             status="SUCCESS",
             deployment_method=method,

@@ -20,6 +20,18 @@ deny {
     input.environment == "production"
 }
 
+# Deny deletion of critical databases in production
+deny {
+    startswith(input.action, "rds:Delete")
+    input.environment == "production"
+}
+
+# Deny setting IMDS to optional
+deny {
+    input.action == "ec2:ModifyInstanceMetadataOptions"
+    input.http_tokens == "optional"
+}
+
 # Explicitly allow safe read actions
 allow {
     startswith(input.action, "s3:Get")

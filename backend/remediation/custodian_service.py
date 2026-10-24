@@ -256,6 +256,27 @@ class CloudCustodianService:
                             })
                             logs.append(f"custodian.actions:INFO Revoked unrestricted SSH (0.0.0.0/0:22) on Security Group '{sg_id}'")
 
+                        elif act_type == "modify-instance-metadata-options":
+                            inst_id = target_name or "i-0123456789abcdef0"
+                            if is_live:
+                                ec2_client = get_localstack_client("ec2", endpoint_url=target_endpoint)
+                                try:
+                                    ec2_client.modify_instance_metadata_options(
+                                        InstanceId=inst_id,
+                                        HttpTokens="required",
+                                        HttpEndpoint="enabled",
+                                    )
+                                except Exception as imds_err:
+                                    logs.append(f"IMDS modification error: {imds_err}")
+
+                            actions_applied.append({
+                                "action": "modify-instance-metadata-options",
+                                "resource": inst_id,
+                                "status": "APPLIED",
+                                "details": "Enforced IMDSv2 (HttpTokens=required)",
+                            })
+                            logs.append(f"custodian.actions:INFO Enforced IMDSv2 on EC2 instance '{inst_id}'")
+
                 # --- IAM Role Policy Handler ---
                 elif policy.resource_type == "iam-role":
                     role_name = target_name or "insecure-app-admin-role"
@@ -282,6 +303,56 @@ class CloudCustodianService:
                                 "details": "Detached wildcard AdministratorAccess policy",
                             })
                             logs.append(f"custodian.actions:INFO Detached AdministratorAccess from IAM role '{role_name}'")
+
+                # --- RDS Database Policy Handler ---
+                elif policy.resource_type == "rds":
+                    db_id = target_name or "vulnerable-customer-db"
+                    matched_resources.append({"DBInstanceIdentifier": db_id})
+
+                    for action in policy.actions:
+                        act_type = action.get("type") if isinstance(action, dict) else action
+                        if act_type in ("set-publicly-accessible", "modify-security-group"):
+                            if is_live:
+                                rds_client = get_localstack_client("rds", endpoint_url=target_endpoint)
+                                try:
+                                    rds_client.modify_db_instance(
+                                        DBInstanceIdentifier=db_id,
+                                        PubliclyAccessible=False,
+                                        ApplyImmediately=True,
+                                    )
+                                except Exception as rds_err:
+                                    logs.append(f"RDS modification error: {rds_err}")
+
+                            actions_applied.append({
+                                "action": "set-publicly-accessible",
+                                "resource": db_id,
+                                "status": "APPLIED",
+                                "details": "Disabled PubliclyAccessible (set to false)",
+                            })
+                            logs.append(f"custodian.actions:INFO Disabled public accessibility on RDS database '{db_id}'")
+
+                # --- CloudTrail Policy Handler ---
+                elif policy.resource_type == "cloudtrail":
+                    trail_name = target_name or "cloudybug-trail"
+                    matched_resources.append({"Name": trail_name})
+
+                    for action in policy.actions:
+                        act_type = action.get("type") if isinstance(action, dict) else action
+                        if act_type == "start-logging":
+                            if is_live:
+                                ct_client = get_localstack_client("cloudtrail", endpoint_url=target_endpoint)
+                                try:
+                                    ct_client.start_logging(Name=trail_name)
+                                except Exception as ct_err:
+                                    logs.append(f"CloudTrail start-logging error: {ct_err}")
+
+                            actions_applied.append({
+                                "action": "start-logging",
+                                "resource": trail_name,
+                                "status": "APPLIED",
+                                "details": "Started CloudTrail audit logging",
+                            })
+                            logs.append(f"custodian.actions:INFO Started CloudTrail logging on trail '{trail_name}'")
 
             except Exception as e:
                 success = False
@@ -327,6 +398,10 @@ class CloudCustodianService:
             "ENABLE_S3_DEFAULT_ENCRYPTION": "s3-remediate-enable-default-encryption",
             "REVOKE_SECURITY_GROUP_INGRESS": "ec2-remediate-revoke-unrestricted-ssh",
             "DETACH_IAM_ADMIN_POLICY": "iam-remediate-detach-administrator-access",
+            "ENFORCE_IMDSV2": "ec2-remediate-enforce-imdsv2",
+            "ENABLE_S3_VERSIONING": "s3-remediate-enable-versioning",
+            "DISABLE_RDS_PUBLIC_ACCESS": "rds-remediate-disable-public-access",
+            "START_CLOUDTRAIL_LOGGING": "cloudtrail-remediate-enable-logging",
         }
 
         for action in actions:
@@ -342,10 +417,18 @@ class CloudCustodianService:
                     policy_name = "s3-remediate-block-public-access"
                 elif service == "s3" and "encrypt" in desc:
                     policy_name = "s3-remediate-enable-default-encryption"
-                elif "ssh" in desc or "22" in desc or service == "ec2":
+                elif service == "s3" and "version" in desc:
+                    policy_name = "s3-remediate-enable-versioning"
+                elif "ssh" in desc or "22" in desc:
                     policy_name = "ec2-remediate-revoke-unrestricted-ssh"
+                elif "imds" in desc:
+                    policy_name = "ec2-remediate-enforce-imdsv2"
                 elif "admin" in desc or service == "iam":
                     policy_name = "iam-remediate-detach-administrator-access"
+                elif "rds" in service or "database" in desc:
+                    policy_name = "rds-remediate-disable-public-access"
+                elif "cloudtrail" in service or "logging" in desc or "trail" in desc:
+                    policy_name = "cloudtrail-remediate-enable-logging"
 
             if policy_name:
                 policy = self.get_policy(policy_name)

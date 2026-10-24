@@ -1,0 +1,11 @@
+policies:
+  - name: cloudtrail-remediate-enable-logging
+    resource: cloudtrail
+    comment: "Automatically restart CloudTrail audit logging to restore security monitoring"
+    filters:
+      - type: status
+        key: IsLogging
+        op: equal
+        value: false
+    actions:
+      - type: start-logging

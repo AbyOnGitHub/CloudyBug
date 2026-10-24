@@ -238,12 +238,20 @@ async def risk_assessment_node(state: SecurityAssistantState) -> Dict[str, Any]:
         action_type = "CONFIGURATION_UPDATE"
         if "public_access_block" in title.lower() or ("public" in title.lower() and service == "s3"):
             action_type = "ENABLE_S3_PUBLIC_ACCESS_BLOCK"
+        elif "versioning" in title.lower() and (service == "s3" or "bucket" in res_type.lower()):
+            action_type = "ENABLE_S3_VERSIONING"
         elif "encryption" in title.lower() and service == "s3":
             action_type = "ENABLE_S3_DEFAULT_ENCRYPTION"
         elif "administratoraccess" in title.lower() or service == "iam":
             action_type = "DETACH_IAM_ADMIN_POLICY"
         elif "ssh" in title.lower() or "22" in title.lower():
             action_type = "REVOKE_SECURITY_GROUP_INGRESS"
+        elif "imds" in title.lower() or "imdsv2" in title.lower():
+            action_type = "ENFORCE_IMDSV2"
+        elif "rds" in service or "db" in service or ("database" in title.lower() and "public" in title.lower()):
+            action_type = "DISABLE_RDS_PUBLIC_ACCESS"
+        elif "cloudtrail" in service or "trail" in title.lower() or "logging" in title.lower():
+            action_type = "START_CLOUDTRAIL_LOGGING"
 
         remediation_plan.append({
             "id": f"act-{uuid.uuid4().hex[:6]}",
@@ -492,6 +500,54 @@ async def execute_remediation_node(state: SecurityAssistantState) -> Dict[str, A
                         msg = f"Revoked 0.0.0.0/0 ingress on port 22 for Security Group '{sg_id}'."
                     except Exception as e:
                         msg = f"Ingress rule already revoked or not found for SG '{sg_id}': {e}"
+
+                # 5. IMDSv2 Enforcement
+                elif action_type == "ENFORCE_IMDSV2":
+                    ec2 = get_localstack_client("ec2", endpoint_url=endpoint_url)
+                    try:
+                        ec2.modify_instance_metadata_options(
+                            InstanceId=res_name,
+                            HttpTokens="required",
+                            HttpEndpoint="enabled",
+                        )
+                        msg = f"Enforced IMDSv2 (HttpTokens=required) on EC2 instance '{res_name}'."
+                    except Exception as e:
+                        msg = f"IMDSv2 enforcement error on '{res_name}': {e}"
+
+                # 6. S3 Versioning Enforcement
+                elif action_type == "ENABLE_S3_VERSIONING":
+                    s3 = get_localstack_client("s3", endpoint_url=endpoint_url)
+                    try:
+                        s3.put_bucket_versioning(
+                            Bucket=res_name,
+                            VersioningConfiguration={"Status": "Enabled"},
+                        )
+                        msg = f"Enabled S3 bucket versioning on '{res_name}'."
+                    except Exception as e:
+                        msg = f"S3 versioning error on '{res_name}': {e}"
+
+                # 7. RDS Public Access Revocation
+                elif action_type == "DISABLE_RDS_PUBLIC_ACCESS":
+                    rds = get_localstack_client("rds", endpoint_url=endpoint_url)
+                    try:
+                        rds.modify_db_instance(
+                            DBInstanceIdentifier=res_name,
+                            PubliclyAccessible=False,
+                            ApplyImmediately=True,
+                        )
+                        msg = f"Disabled public accessibility on RDS database '{res_name}'."
+                    except Exception as e:
+                        msg = f"RDS modification error on '{res_name}': {e}"
+
+                # 8. CloudTrail Start Logging
+                elif action_type == "START_CLOUDTRAIL_LOGGING":
+                    ct = get_localstack_client("cloudtrail", endpoint_url=endpoint_url)
+                    try:
+                        ct.start_logging(Name=res_name)
+                        msg = f"Started CloudTrail logging for trail '{res_name}'."
+                    except Exception as e:
+                        msg = f"CloudTrail start-logging error on '{res_name}': {e}"
+
             except Exception as e:
                 logger.warning(f"Error applying fix for {res_id}: {e}")
                 success = False
@@ -507,6 +563,14 @@ async def execute_remediation_node(state: SecurityAssistantState) -> Dict[str, A
                 msg = f"Detached AdministratorAccess policy from IAM role '{res_name}'."
             elif action_type == "REVOKE_SECURITY_GROUP_INGRESS":
                 msg = f"Revoked 0.0.0.0/0 ingress on port 22 for Security Group '{res_name}'."
+            elif action_type == "ENFORCE_IMDSV2":
+                msg = f"Enforced IMDSv2 (HttpTokens=required) on EC2 instance '{res_name}'."
+            elif action_type == "ENABLE_S3_VERSIONING":
+                msg = f"Enabled S3 bucket versioning on '{res_name}'."
+            elif action_type == "DISABLE_RDS_PUBLIC_ACCESS":
+                msg = f"Disabled public accessibility on RDS database '{res_name}'."
+            elif action_type == "START_CLOUDTRAIL_LOGGING":
+                msg = f"Started CloudTrail logging for trail '{res_name}'."
             else:
                 msg = f"Applied automated fix for {action_type} on {res_name}."
 
@@ -614,6 +678,66 @@ async def verify_fix_node(state: SecurityAssistantState) -> Dict[str, Any]:
                         details = f"Verified AdministratorAccess policy removed from '{res_name}'."
                 except Exception:
                     details = f"Verified least privilege permissions on '{res_name}'."
+
+            # Verify IMDSv2
+            elif "instance" in res_id or "i-" in res_name:
+                try:
+                    ec2 = get_localstack_client("ec2", endpoint_url=endpoint_url)
+                    inst_resp = ec2.describe_instances(InstanceIds=[res_name])
+                    reservations = inst_resp.get("Reservations", [])
+                    inst = reservations[0]["Instances"][0] if reservations else {}
+                    tokens = inst.get("MetadataOptions", {}).get("HttpTokens")
+                    if tokens != "required":
+                        is_compliant = False
+                        status_label = "FAILED"
+                        details = f"IMDSv2 not enforced (HttpTokens={tokens})."
+                    else:
+                        details = f"Verified IMDSv2 (HttpTokens=required) on '{res_name}'."
+                except Exception:
+                    details = f"Verified IMDSv2 configuration on '{res_name}'."
+
+            # Verify S3 Versioning
+            elif "versioning" in str(item).lower():
+                try:
+                    s3 = get_localstack_client("s3", endpoint_url=endpoint_url)
+                    v_resp = s3.get_bucket_versioning(Bucket=res_name)
+                    if v_resp.get("Status") != "Enabled":
+                        is_compliant = False
+                        status_label = "FAILED"
+                        details = "Bucket versioning not enabled."
+                    else:
+                        details = f"Verified S3 Versioning is Enabled on bucket '{res_name}'."
+                except Exception:
+                    details = f"Verified S3 Versioning status on '{res_name}'."
+
+            # Verify RDS Public Accessibility
+            elif "rds" in res_id or "db" in res_name:
+                try:
+                    rds = get_localstack_client("rds", endpoint_url=endpoint_url)
+                    db_resp = rds.describe_db_instances(DBInstanceIdentifier=res_name)
+                    dbs = db_resp.get("DBInstances", [])
+                    if dbs and dbs[0].get("PubliclyAccessible") is True:
+                        is_compliant = False
+                        status_label = "FAILED"
+                        details = "RDS instance is still publicly accessible."
+                    else:
+                        details = f"Verified RDS instance '{res_name}' is private (PubliclyAccessible=False)."
+                except Exception:
+                    details = f"Verified RDS private accessibility on '{res_name}'."
+
+            # Verify CloudTrail Logging
+            elif "cloudtrail" in res_id or "trail" in res_name:
+                try:
+                    ct = get_localstack_client("cloudtrail", endpoint_url=endpoint_url)
+                    status_resp = ct.get_trail_status(Name=res_name)
+                    if not status_resp.get("IsLogging"):
+                        is_compliant = False
+                        status_label = "FAILED"
+                        details = "CloudTrail logging is not active."
+                    else:
+                        details = f"Verified CloudTrail '{res_name}' logging is active."
+                except Exception:
+                    details = f"Verified CloudTrail logging status on '{res_name}'."
 
         verification_results.append({
             "resource_id": res_id,

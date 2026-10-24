@@ -1,0 +1,12 @@
+policies:
+  - name: s3-remediate-enable-versioning
+    resource: s3
+    comment: "Automatically enforce object versioning on S3 buckets for ransomware defense and recovery"
+    filters:
+      - type: value
+        key: Versioning.Status
+        op: not-equal
+        value: Enabled
+    actions:
+      - type: toggle-versioning
+        enabled: true

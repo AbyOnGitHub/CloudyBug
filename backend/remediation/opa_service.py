@@ -78,7 +78,11 @@ class OPAService:
             return False
             
         # Deny deleting resources in production
-        if action.startswith("s3:Delete") and input_data.get("environment") == "production":
+        if (action.startswith("s3:Delete") or action.startswith("rds:Delete")) and input_data.get("environment") == "production":
+            return False
+
+        # Deny setting IMDS to optional
+        if action == "ec2:ModifyInstanceMetadataOptions" and input_data.get("http_tokens") == "optional":
             return False
             
         return True

@@ -215,6 +215,7 @@ async def list_services() -> Dict[str, Any]:
                     "s3_bucket_default_encryption",
                     "s3_bucket_public_access_block",
                     "s3_bucket_policy_public_read",
+                    "s3_bucket_versioning_enabled",
                 ],
             },
             {
@@ -223,6 +224,7 @@ async def list_services() -> Dict[str, Any]:
                 "checks": [
                     "iam_role_administrator_access",
                     "iam_password_policy_minimum_length",
+                    "iam_user_access_keys_stale",
                 ],
             },
             {
@@ -231,6 +233,21 @@ async def list_services() -> Dict[str, Any]:
                 "checks": [
                     "ec2_security_group_open_ssh_port",
                     "ec2_ebs_volume_encryption",
+                    "ec2_instance_imdsv2_enforced",
+                ],
+            },
+            {
+                "service": "rds",
+                "name": "Relational Database Service",
+                "checks": [
+                    "rds_instance_no_public_access",
+                ],
+            },
+            {
+                "service": "cloudtrail",
+                "name": "AWS CloudTrail",
+                "checks": [
+                    "cloudtrail_multi_region_enabled",
                 ],
             },
         ],

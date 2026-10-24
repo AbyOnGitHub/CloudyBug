@@ -136,7 +136,8 @@ def test_llm_prompt_block_generation():
     sample_raw = get_sample_asff_findings()
     findings = LLMASFFParser.parse_findings(sample_raw)
 
-    assert len(findings) == 6
+    assert len(findings) == len(sample_raw)
+    assert len(findings) >= 6
 
     # Test single block
     first_block = findings[0].to_llm_prompt_block()

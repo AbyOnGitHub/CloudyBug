@@ -1,0 +1,12 @@
+policies:
+  - name: rds-remediate-disable-public-access
+    resource: rds
+    comment: "Automatically remove public accessibility from Amazon RDS databases"
+    filters:
+      - type: value
+        key: PubliclyAccessible
+        op: equal
+        value: true
+    actions:
+      - type: set-publicly-accessible
+        state: false

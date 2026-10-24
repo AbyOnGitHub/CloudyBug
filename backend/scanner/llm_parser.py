@@ -143,6 +143,8 @@ class LLMResourceMetadata(BaseModel):
             service = "ec2"
         elif "rds" in type_lower:
             service = "rds"
+        elif "cloudtrail" in type_lower or "trail" in type_lower or "trail" in arn:
+            service = "cloudtrail"
         elif "lambda" in type_lower:
             service = "lambda"
 
@@ -214,6 +216,18 @@ class LLMRemediation(BaseModel):
         elif "ssh" in title_lower or ("22" in title_lower and resource.service == "ec2"):
             cli_cmd = f"aws ec2 revoke-security-group-ingress --group-id {resource.name} --protocol tcp --port 22 --cidr 0.0.0.0/0"
             tf_snippet = f'# Remove 0.0.0.0/0 on port 22 in security group "{resource.name}"'
+        elif "imds" in title_lower or "imdsv2" in title_lower:
+            cli_cmd = f"aws ec2 modify-instance-metadata-options --instance-id {resource.name} --http-tokens required --http-endpoint enabled"
+            tf_snippet = f'resource "aws_instance" "remediation" {{\n  # ...\n  metadata_options {{\n    http_tokens   = "required"\n    http_endpoint = "enabled"\n  }}\n}}'
+        elif "versioning" in title_lower and (resource.service == "s3" or "bucket" in resource.resource_type.lower()):
+            cli_cmd = f"aws s3api put-bucket-versioning --bucket {resource.name} --versioning-configuration Status=Enabled"
+            tf_snippet = f'resource "aws_s3_bucket_versioning" "remediation" {{\n  bucket = "{resource.name}"\n  versioning_configuration {{\n    status = "Enabled"\n  }}\n}}'
+        elif "rds" in title_lower or resource.service == "rds" or "db" in resource.service.lower():
+            cli_cmd = f"aws rds modify-db-instance --db-instance-identifier {resource.name} --no-publicly-accessible --apply-immediately"
+            tf_snippet = f'# Modify RDS instance to disable public access\nresource "aws_db_instance" "remediation" {{\n  # ...\n  publicly_accessible = false\n}}'
+        elif "cloudtrail" in title_lower or "trail" in resource.service.lower():
+            cli_cmd = f"aws cloudtrail start-logging --name {resource.name}"
+            tf_snippet = f'# Enable CloudTrail logging\nresource "aws_cloudtrail" "remediation" {{\n  # ...\n  enable_logging = true\n}}'
 
         return cls(
             recommendation_summary=rec_text,
@@ -333,15 +347,17 @@ class LLMASFFParser:
         """Categorize finding into clear threat modeling vector for LLM understanding."""
         combined = f"{title} {resource_type} {description}".lower()
         if "public" in combined or "leak" in combined or "unrestricted" in combined:
-            if "s3" in combined or "bucket" in combined or "data" in combined:
+            if "s3" in combined or "bucket" in combined or "data" in combined or "rds" in combined or "database" in combined:
                 return RiskCategory.DATA_EXPOSURE
-        if "iam" in combined or "administratoraccess" in combined or "privilege" in combined or "role" in combined:
+        if "iam" in combined or "administratoraccess" in combined or "privilege" in combined or "role" in combined or "imds" in combined:
             return RiskCategory.PRIVILEGE_ESCALATION
         if "ssh" in combined or "security group" in combined or "0.0.0.0/0" in combined or "port" in combined:
             return RiskCategory.PERIMETER_BREACH
         if "encryption" in combined or "kms" in combined or "sse" in combined:
             return RiskCategory.ENCRYPTION_AT_REST
-        if "compliance" in combined or "logging" in combined or "trail" in combined:
+        if "versioning" in combined:
+            return RiskCategory.DATA_EXPOSURE
+        if "compliance" in combined or "logging" in combined or "trail" in combined or "cloudtrail" in combined:
             return RiskCategory.GOVERNANCE_AUDIT
         return RiskCategory.OTHER
 
@@ -426,6 +442,12 @@ class LLMASFFParser:
     def map_mitre_attack(check_id: str, risk_category: RiskCategory) -> Optional[str]:
         """Map security check or risk category to MITRE ATT&CK Cloud Matrix technique."""
         check_lower = check_id.lower()
+        if "imds" in check_lower:
+            return "T1552.005: Cloud Instance Metadata API"
+        if "versioning" in check_lower:
+            return "T1485: Data Destruction"
+        if "rds" in check_lower and "public" in check_lower:
+            return "T1190: Exploit Public-Facing Application"
         if "s3" in check_lower and ("public" in check_lower or "leak" in check_lower or "acl" in check_lower):
             return "T1530: Data from Cloud Storage Object"
         if "encryption" in check_lower:

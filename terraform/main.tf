@@ -13,6 +13,18 @@ resource "aws_s3_bucket" "vulnerable_bucket" {
   }
 }
 
+# AWS (and LocalStack 4.x) enable all Public Access Block flags by default on new
+# buckets since April 2023, so omitting the PAB is no longer enough. Explicitly
+# disable it to keep this bucket intentionally vulnerable.
+resource "aws_s3_bucket_public_access_block" "vulnerable_pab" {
+  bucket = aws_s3_bucket.vulnerable_bucket.id
+
+  block_public_acls       = false
+  block_public_policy     = false
+  ignore_public_acls      = false
+  restrict_public_buckets = false
+}
+
 # Compliant Bucket: SSE-S3 Encrypted and Public Access Blocked
 resource "aws_s3_bucket" "compliant_bucket" {
   bucket        = "secure-encrypted-backup-bucket"
@@ -209,5 +221,53 @@ resource "aws_iam_role" "agent_execution_role" {
   })
 
   permissions_boundary = aws_iam_policy.agent_permissions_boundary.arn
+}
+
+# ==========================================
+# 5. EC2 Instance (Vulnerable IMDSv1)
+# ==========================================
+resource "aws_instance" "vulnerable_ec2" {
+  ami           = "ami-00000000"
+  instance_type = "t3.micro"
+
+  metadata_options {
+    http_tokens   = "optional"
+    http_endpoint = "enabled"
+  }
+
+  tags = {
+    Name          = "vulnerable-web-app"
+    SecurityAudit = "Failed-IMDSv1"
+  }
+}
+
+# ==========================================
+# 6. Amazon RDS Database (Publicly Accessible)
+# ==========================================
+resource "aws_db_instance" "vulnerable_db" {
+  identifier          = "vulnerable-customer-db"
+  allocated_storage   = 5
+  instance_class      = "db.t3.micro"
+  engine              = "postgres"
+  publicly_accessible = true
+  skip_final_snapshot = true
+
+  tags = {
+    SecurityAudit = "Failed-PublicRDS"
+  }
+}
+
+# ==========================================
+# 7. AWS CloudTrail (Logging Disabled)
+# ==========================================
+resource "aws_cloudtrail" "audit_trail" {
+  name                          = "cloudybug-trail"
+  s3_bucket_name                = aws_s3_bucket.compliant_bucket.id
+  enable_logging                = false
+  include_global_service_events = true
+
+  tags = {
+    SecurityAudit = "Failed-CloudTrailDisabled"
+  }
 }
 

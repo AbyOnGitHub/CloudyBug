@@ -1,0 +1,13 @@
+policies:
+  - name: ec2-remediate-enforce-imdsv2
+    resource: ec2
+    comment: "Automatically enforce IMDSv2 token requirement on EC2 instances to mitigate SSRF credential theft"
+    filters:
+      - type: value
+        key: MetadataOptions.HttpTokens
+        op: equal
+        value: optional
+    actions:
+      - type: modify-instance-metadata-options
+        http_tokens: required
+        http_endpoint: enabled

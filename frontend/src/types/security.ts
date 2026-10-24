@@ -96,7 +96,7 @@ export interface CloudResourceCard {
   name: string;
   arn: string;
   type: string;
-  service: 'EC2' | 'IAM' | 'S3';
+  service: 'EC2' | 'IAM' | 'S3' | 'RDS' | 'CLOUDTRAIL' | 'OTHER';
   status: 'COMPLIANT' | 'VULNERABLE' | 'NEEDS_ATTENTION';
   issue?: string;
   severity?: SeverityLevel;

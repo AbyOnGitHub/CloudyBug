@@ -40,7 +40,7 @@ class CedarService:
         try:
             # Fallback logic simulating the Cedar policy evaluation
             is_production = context.get("environment", "") == "production"
-            is_destructive = action in ["delete", "modify_critical_policy", "s3:DeleteBucket", "iam:AttachRolePolicy"]
+            is_destructive = action in ["delete", "modify_critical_policy", "s3:DeleteBucket", "rds:DeleteDBInstance", "iam:AttachRolePolicy"]
             
             if is_production and is_destructive:
                 logger.warning(f"Cedar Authorization Denied: Action {action} forbidden in production.")
